@@ -477,6 +477,34 @@ class SwaggerParser(object):
         except:
             return False
 
+    def _get_spec(self, definition_name, definition=None):
+        """Get the specification according to the given definition.
+
+                Args:
+                    definition_name: name of the the definition.
+
+                Returns:
+                    True if the given dict match the definition, False otherwise.
+                """
+        if (definition_name not in self.specification['definitions'].keys() and
+                definition is None):
+            # reject unknown definition
+            raise ValueError('Unknown definition: {}'.format(definition_name))
+
+        spec_def = definition or self.specification['definitions'][definition_name]
+
+        required = spec_def.get('required', {})
+        properties = spec_def.get('properties', {})
+
+        for parent in spec_def.get('allOf', []):
+            parent_required, parent_properties = self._get_spec(
+                self.get_definition_name_from_ref(parent['$ref'])
+            )
+            required.update(parent_required)
+            properties.update(parent_properties)
+
+        return required, properties
+
     def validate_definition(self, definition_name, dict_to_test, definition=None):
         """Validate the given dict according to the given definition.
 
@@ -487,25 +515,19 @@ class SwaggerParser(object):
         Returns:
             True if the given dict match the definition, False otherwise.
         """
-        if (definition_name not in self.specification['definitions'].keys() and
-                definition is None):
-            # reject unknown definition
-            raise Exception('Unknown definition')
+        required, properties = self._get_spec(definition_name, definition)
 
-        # Check all required in dict_to_test
-        spec_def = definition or self.specification['definitions'][definition_name]
-        all_required_keys_present = all(req in dict_to_test.keys() for req in spec_def.get('required', {}))
-        if 'required' in spec_def and not all_required_keys_present:
+        all_required_keys_present = all(req in dict_to_test.keys() for req in required)
+        if not all_required_keys_present:
             raise Exception('Not all required attributes are present.')
 
         # Check no extra arg & type
-        properties_dict = spec_def.get('properties', {})
         for key, value in dict_to_test.items():
             if value is not None:
-                if key not in properties_dict:  # Extra arg
+                if key not in properties:  # Extra arg
                     raise Exception('Extra attribute: "{}"'.format(key))
                 else:  # Check type
-                    if not self._validate_type(properties_dict[key], value):
+                    if not self._validate_type(properties[key], value):
                         raise Exception('Type mismatch for "{}" got "{}"'.format(key, value))
 
         return True
