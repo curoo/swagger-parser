@@ -176,7 +176,7 @@ class SwaggerParser(object):
                 return example
             return [example]
         # Array
-        if prop_spec['type'] == 'array':
+        if prop_spec['type'] == 'array' or (isinstance(prop_spec['type'], list) and prop_spec['type'][0] == 'array'):
             return self._example_from_array_spec(prop_spec)
         # File
         if prop_spec['type'] == 'file':
@@ -223,18 +223,19 @@ class SwaggerParser(object):
 
         example = {}
         properties = local_spec.get('properties')
-        required = local_spec.get('required', properties.keys())
+        if properties is not None:
+            required = local_spec.get('required', properties.keys())
 
-        for inner_name, inner_spec in properties.items():
-            if inner_name not in required:
-                continue
-            partial = self.get_example_from_prop_spec(inner_spec)
-            # While get_example_from_prop_spec is supposed to return a list,
-            # we don't actually want that when recursing to build from
-            # properties
-            if isinstance(partial, list):
-                partial = partial[0]
-            example[inner_name] = partial
+            for inner_name, inner_spec in properties.items():
+                if inner_name not in required:
+                    continue
+                partial = self.get_example_from_prop_spec(inner_spec)
+                # While get_example_from_prop_spec is supposed to return a list,
+                # we don't actually want that when recursing to build from
+                # properties
+                if isinstance(partial, list):
+                    partial = partial[0]
+                example[inner_name] = partial
 
         return example, additional_property
 
@@ -258,6 +259,8 @@ class SwaggerParser(object):
             return ['2015-08-28T09:02:57.481Z', '2015-08-28T09:02:57.481Z']
         elif type == 'boolean':
             return [False, True]
+        elif type == 'null':
+            return ['null', 'null']
 
     @staticmethod
     def _definition_from_example(example):
@@ -274,8 +277,8 @@ class SwaggerParser(object):
         assert isinstance(example, dict)
 
         def _has_simple_type(value):
-            accepted = [str, int, float, bool]
-            return any(isinstance(value, x) for x in accepted)
+            accepted = (str, int, float, bool)
+            return isinstance(value, accepted)
 
         definition = {
             'type': 'object',
@@ -329,7 +332,9 @@ class SwaggerParser(object):
         Returns:
             An example.
         """
-        if 'schema' in prop_spec and 'type' not in prop_spec['schema']:
+        if 'schema' not in prop_spec:
+            return [{}]
+        elif 'type' not in prop_spec['schema']:
             definition_name = self.get_definition_name_from_ref(prop_spec['schema']['$ref'])
             if self.build_one_definition_example(definition_name):
                 return self.definitions_example[definition_name]
@@ -338,7 +343,11 @@ class SwaggerParser(object):
             if 'items' in prop_spec.keys():
                 definition_name = self.get_definition_name_from_ref(prop_spec['items']['$ref'])
             else:
-                definition_name = self.get_definition_name_from_ref(prop_spec['schema']['items']['$ref'])
+                if '$ref' in prop_spec['schema']['items']:
+                    definition_name = self.get_definition_name_from_ref(prop_spec['schema']['items']['$ref'])
+                else:
+                    definition_name = self.get_definition_name_from_ref(prop_spec['schema']['items']['type'])
+                    return [definition_name]
             return [self.definitions_example[definition_name]]
         else:
             return self.get_example_from_prop_spec(prop_spec['schema'])
@@ -352,8 +361,11 @@ class SwaggerParser(object):
         Returns:
             An example array.
         """
+        # if items is a list, then each item has its own spec
+        if isinstance(prop_spec['items'], list):
+            return [self.get_example_from_prop_spec(item_prop_spec) for item_prop_spec in prop_spec['items']]
         # Standard types in array
-        if 'type' in prop_spec['items'].keys():
+        elif 'type' in prop_spec['items'].keys():
             if 'format' in prop_spec['items'].keys() and prop_spec['items']['format'] == 'date-time':
                 return self._get_example_from_basic_type('datetime')
             else:
@@ -367,8 +379,15 @@ class SwaggerParser(object):
                 self.get_definition_name_from_ref(prop_spec['schema']['items']['$ref'])
             if self.build_one_definition_example(definition_name):
                 example_dict = self.definitions_example[definition_name]
+                if not isinstance(example_dict, dict):
+                    return [example_dict]
                 if len(example_dict) == 1:
-                    return example_dict[list(example_dict.keys())[0]]
+                    try:  # Python 2.7
+                        res = example_dict[example_dict.keys()[0]]
+                    except TypeError:  # Python 3
+                        res = example_dict[list(example_dict)[0]]
+                    return res
+
                 else:
                     return_value = {}
                     for example_name, example_value in example_dict.items():
@@ -458,6 +477,34 @@ class SwaggerParser(object):
         except:
             return False
 
+    def _get_spec(self, definition_name, definition=None):
+        """Get the specification according to the given definition.
+
+                Args:
+                    definition_name: name of the the definition.
+
+                Returns:
+                    True if the given dict match the definition, False otherwise.
+                """
+        if (definition_name not in self.specification['definitions'].keys() and
+                definition is None):
+            # reject unknown definition
+            raise ValueError('Unknown definition: {}'.format(definition_name))
+
+        spec_def = definition or self.specification['definitions'][definition_name]
+
+        required = spec_def.get('required', {})
+        properties = spec_def.get('properties', {})
+
+        for parent in spec_def.get('allOf', []):
+            parent_required, parent_properties = self._get_spec(
+                self.get_definition_name_from_ref(parent['$ref'])
+            )
+            required.update(parent_required)
+            properties.update(parent_properties)
+
+        return required, properties
+
     def validate_definition(self, definition_name, dict_to_test, definition=None):
         """Validate the given dict according to the given definition.
 
@@ -468,25 +515,19 @@ class SwaggerParser(object):
         Returns:
             True if the given dict match the definition, False otherwise.
         """
-        if (definition_name not in self.specification['definitions'].keys() and
-                definition is None):
-            # reject unknown definition
-            raise Exception('Unknown definition')
+        required, properties = self._get_spec(definition_name, definition)
 
-        # Check all required in dict_to_test
-        spec_def = definition or self.specification['definitions'][definition_name]
-        all_required_keys_present = all(req in dict_to_test.keys() for req in spec_def.get('required', {}))
-        if 'required' in spec_def and not all_required_keys_present:
+        all_required_keys_present = all(req in dict_to_test.keys() for req in required)
+        if not all_required_keys_present:
             raise Exception('Not all required attributes are present.')
 
         # Check no extra arg & type
-        properties_dict = spec_def['properties']
         for key, value in dict_to_test.items():
             if value is not None:
-                if key not in properties_dict:  # Extra arg
+                if key not in properties:  # Extra arg
                     raise Exception('Extra attribute: "{}"'.format(key))
                 else:  # Check type
-                    if not self._validate_type(properties_dict[key], value):
+                    if not self._validate_type(properties[key], value):
                         raise Exception('Type mismatch for "{}" got "{}"'.format(key, value))
 
         return True
@@ -796,7 +837,15 @@ class SwaggerParser(object):
                 definition_name = self.get_definition_name_from_ref(resp_spec['schema']['$ref'])
                 return self.definitions_example[definition_name]
             elif 'items' in resp_spec['schema'] and resp_spec['schema']['type'] == 'array':  # Array
-                definition_name = self.get_definition_name_from_ref(resp_spec['schema']['items']['$ref'])
+                if '$ref' in resp_spec['schema']['items']:
+                    definition_name = self.get_definition_name_from_ref(resp_spec['schema']['items']['$ref'])
+                else:
+                    if 'type' in resp_spec['schema']['items']:
+                        definition_name = self.get_definition_name_from_ref(resp_spec['schema']['items'])
+                        return [definition_name]
+                    else:
+                        logging.warn("No item type in: " + resp_spec['schema'])
+                        return ''
                 return [self.definitions_example[definition_name]]
             elif 'type' in resp_spec['schema']:
                 return self.get_example_from_prop_spec(resp_spec['schema'])
@@ -856,8 +905,14 @@ class SwaggerParser(object):
                             if 'type' in spec['schema'].keys() and spec['schema']['type'] == 'array':
                                 # It is an array
                                 # Get value from definition
-                                definition_name = self.get_definition_name_from_ref(spec['schema']['items']['$ref'])
-                                return [self.definitions_example[definition_name]]
+                                if '$ref' in spec['schema']['items']:
+                                    definition_name = self.get_definition_name_from_ref(spec['schema']
+                                                                                        ['items']['$ref'])
+                                    return [self.definitions_example[definition_name]]
+                                else:
+                                    definition_name = self.get_definition_name_from_ref(spec['schema']
+                                                                                        ['items']['type'])
+                                    return [definition_name]
                             elif 'type' in spec['schema'].keys():
                                 # Type but not array
                                 return self.get_example_from_prop_spec(spec['schema'])
