@@ -493,15 +493,24 @@ class SwaggerParser(object):
 
         spec_def = definition or self.specification['definitions'][definition_name]
 
-        required = spec_def.get('required', {})
-        properties = spec_def.get('properties', {})
-
-        for parent in spec_def.get('allOf', []):
-            parent_required, parent_properties = self._get_spec(
-                self.get_definition_name_from_ref(parent['$ref'])
-            )
-            required.update(parent_required)
-            properties.update(parent_properties)
+        allOf = spec_def.get('allOf')
+        if allOf:
+            required = []
+            properties = {}
+            for item in allOf:
+                if item.get('$ref'):
+                    parent_required, parent_properties = self._get_spec(
+                        self.get_definition_name_from_ref(item.get('$ref'))
+                    )
+                else:
+                    parent_required, parent_properties = self._get_spec(
+                        None, item
+                    )
+                required += parent_required
+                properties.update(parent_properties)
+        else:
+            required = spec_def.get('required', [])
+            properties = spec_def.get('properties', {})
 
         return required, properties
 
@@ -517,9 +526,9 @@ class SwaggerParser(object):
         """
         required, properties = self._get_spec(definition_name, definition)
 
-        all_required_keys_present = all(req in dict_to_test.keys() for req in required)
-        if not all_required_keys_present:
-            raise Exception('Not all required attributes are present.')
+        not_all_required_keys_present = required - dict_to_test.keys()
+        if not_all_required_keys_present:
+            raise Exception('Not all required attributes are present: {}'.format(not_all_required_keys_present))
 
         # Check no extra arg & type
         for key, value in dict_to_test.items():
